@@ -67,14 +67,15 @@ func JobMatchesTorrent(infoHash, title, torrentHash, torrentName string) bool {
 	return titlesMatch(title, torrentName)
 }
 
-// infoHashTracked reports whether any job row already records this infohash.
-func (m *Manager) infoHashTracked(hash string) bool {
+// infoHashTracked reports whether a job row already records this infohash in
+// the named download client. Older rows without a client belong to qBittorrent.
+func (m *Manager) infoHashTracked(hash, clientName string) bool {
 	if hash == "" {
 		return false
 	}
 	for _, item := range m.jobs.Items() {
 		ih, _ := item.Data["info_hash"].(string)
-		if strings.EqualFold(ih, hash) {
+		if strings.EqualFold(ih, hash) && strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
 			return true
 		}
 	}
@@ -84,8 +85,11 @@ func (m *Manager) infoHashTracked(hash string) bool {
 // jobForTorrent returns the id of the job already tracking this torrent. It
 // shares JobMatchesTorrent with the watcher so the two cannot disagree about
 // which row belongs to a torrent.
-func (m *Manager) jobForTorrent(torrentHash, torrentName string) (string, bool) {
+func (m *Manager) jobForTorrent(torrentHash, torrentName, clientName string) (string, bool) {
 	for _, item := range m.jobs.Items() {
+		if !strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
+			continue
+		}
 		infoHash, _ := item.Data["info_hash"].(string)
 		title, _ := item.Data["title"].(string)
 		if JobMatchesTorrent(infoHash, title, torrentHash, torrentName) {

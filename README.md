@@ -129,7 +129,7 @@ Open `http://localhost:5001` in your browser.
 ### Search and Discovery
 
 - **Pluggable indexer registry** -- driver kinds (Torznab proxy, DDL archive listing, web-scrape, Minerva browse listing) loaded at runtime from an embedded JSON registry; optionally overrideable via `GAMARR_SOURCES_URL` / `GAMARR_SOURCES_PATH`
-- **Minerva Archive** -- loads the per-system browse page (every title on that console), caches it for an hour, and matches locally. Hits use the shared console archive magnet; Gamarr selects the matching ROM via qBittorrent file priorities. Ranked above Prowlarr.
+- **Minerva Archive** -- loads the per-system browse page (every title on that console), caches it for an hour, and matches locally. Hits use the shared console archive magnet; Gamarr selects the matching ROM via qBittorrent priorities or Transmission's per-file wanted state. Ranked above Prowlarr.
 - **52 gaming platforms** -- PC, Switch, PS1-PS4, PSP, PS Vita, Xbox, Xbox 360, Wii, Wii U, GameCube, N64, (S)NES, the Game Boy family, DS, 3DS, Sega 8-bit to Dreamcast, PC Engine, Neo Geo, Atari, and more, filed into RomM-compatible folders (see [Supported Platforms](#supported-platforms))
 - **Search scoring** -- composite 0-100 score based on title match, platform relevance, seeder count, file size, and safety analysis
 - **Safety scoring** -- analyzes file names, sizes, and scene group trust to detect malware, crack-only uploads, and suspicious downloads
@@ -145,7 +145,8 @@ Open `http://localhost:5001` in your browser.
 ### Downloads
 
 - **5 download clients** -- qBittorrent, Transmission, Deluge (torrents), SABnzbd and NZBGet (Usenet/NZB)
-- **Download monitoring** -- real-time progress tracking with auto-organize on completion
+- **Download monitoring** -- real-time progress tracking with auto-organize on completion for qBittorrent and Transmission, including recovery of in-flight jobs after restart
+- **Transmission watcher scope** -- Gamarr labels submissions `ROMs`; automatic orphan imports only claim Transmission torrents with that label. Older daemons without label RPC support still track Gamarr-submitted jobs but skip untracked orphan imports.
 - **Retry and recovery** -- configurable retry attempts with backoff, orphan torrent recovery on startup
 - **Archive extraction** -- auto-extract 7z, zip, and rar archives after download
 
@@ -477,7 +478,7 @@ volumes:
 
 **2. Gamarr's paths must match the download client's.** There is no remote path
 mapping (the equivalent of Sonarr/Radarr's Remote Path Mappings). Whatever
-qBittorrent reports as a torrent's content path is used verbatim, so it has to
+qBittorrent or Transmission reports as a torrent's content path is used verbatim, so it has to
 resolve to the same content inside the Gamarr container — mount the same parent
 at the same place in both containers. Mounting the download directory at
 `/data/incoming` in Gamarr while the client calls it `/data/downloads/games`

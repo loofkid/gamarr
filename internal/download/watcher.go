@@ -2,6 +2,7 @@ package download
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,12 +10,13 @@ import (
 	"gamarr/internal/qbit"
 )
 
-// Watcher monitors qBittorrent for completed torrents and auto-imports them.
+// Watcher monitors configured torrent clients for completed downloads and
+// auto-imports torrents that do not already have a tracked job.
 type Watcher struct {
 	cfg        *config.Config
 	mgr        *Manager
-	processing sync.Map // hash → struct{} (currently being processed)
-	imported   sync.Map // hash → struct{} (already imported)
+	processing sync.Map // backend-scoped torrent key → struct{} (currently being processed)
+	imported   sync.Map // backend-scoped torrent key → struct{} (already imported)
 	stopCh     chan struct{}
 }
 
@@ -29,7 +31,7 @@ func NewWatcher(cfg *config.Config, mgr *Manager) *Watcher {
 
 // Start begins watching for completed torrents.
 func (w *Watcher) Start() {
-	if !w.cfg.WatcherEnabled || !w.cfg.HasQBittorrent() {
+	if !w.cfg.WatcherEnabled || (!w.cfg.HasQBittorrent() && !w.cfg.HasTransmission()) {
 		slog.Info("torrent watcher disabled")
 		return
 	}
@@ -39,7 +41,7 @@ func (w *Watcher) Start() {
 		interval = 30 * time.Second
 	}
 
-	slog.Info("torrent watcher started", "interval", interval, "category", w.cfg.QBCategory)
+	slog.Info("torrent watcher started", "interval", interval, "qBittorrent", w.cfg.HasQBittorrent(), "Transmission", w.cfg.HasTransmission())
 
 	// Run immediately on start.
 	w.checkCompleted()
@@ -71,32 +73,50 @@ func (w *Watcher) Stop() {
 
 // checkCompleted scans qBittorrent for completed torrents that haven't been imported.
 func (w *Watcher) checkCompleted() {
-	torrents, err := w.mgr.QB().GetTorrents(w.cfg.QBCategory)
-	if err != nil {
-		slog.Warn("watcher: could not read the download client, skipping this pass", "error", err)
-		return
+	clients := make([]string, 0, 2)
+	if w.cfg.HasQBittorrent() {
+		clients = append(clients, qbittorrentClientName)
 	}
-
-	for _, t := range torrents {
-		if t.Progress < 1.0 {
+	if w.cfg.HasTransmission() {
+		clients = append(clients, transmissionClientName)
+	}
+	for _, clientName := range clients {
+		torrents, err := w.mgr.torrentsForClient(clientName)
+		if err != nil {
+			slog.Warn("watcher: could not read a download client, skipping it for this pass", "client", clientName, "error", err)
 			continue
 		}
+		for _, t := range torrents {
+			if t.Progress < 1.0 {
+				continue
+			}
+			// qBittorrent is already scoped to Gamarr's category. Transmission has
+			// no category filter here, so only auto-import torrents carrying the
+			// label applied by Gamarr when it submits them.
+			if strings.EqualFold(t.Client, transmissionClientName) && !IsGamarrManagedTransmissionTorrent(t) {
+				continue
+			}
 
-		// Skip if already imported or currently processing.
-		if _, ok := w.imported.Load(t.Hash); ok {
-			continue
-		}
-		if _, ok := w.processing.Load(t.Hash); ok {
-			continue
-		}
+			key := torrentHashClaim(torrentClientForTorrent(t), t.Hash)
+			if key == "" {
+				key = torrentHashClaim(torrentClientForTorrent(t), "title:"+t.Name)
+			}
+			// Skip if already imported or currently processing in this backend.
+			if _, ok := w.imported.Load(key); ok {
+				continue
+			}
+			if _, ok := w.processing.Load(key); ok {
+				continue
+			}
 
-		// Skip if we already have a tracked job for this torrent.
-		if w.hasMatchingJob(t) {
-			continue
-		}
+			// Skip if we already have a tracked job for this torrent.
+			if w.hasMatchingJob(t) {
+				continue
+			}
 
-		w.processing.Store(t.Hash, struct{}{})
-		go w.importTorrent(t)
+			w.processing.Store(key, struct{}{})
+			go w.importTorrentWithKey(t, key)
+		}
 	}
 }
 
@@ -105,6 +125,9 @@ func (w *Watcher) checkCompleted() {
 // (still claimed by an active job) is not double-imported.
 func (w *Watcher) hasMatchingJob(t qbit.Torrent) bool {
 	for _, item := range w.mgr.Jobs().Items() {
+		if !strings.EqualFold(torrentClientFromJob(item.Data), torrentClientForTorrent(t)) {
+			continue
+		}
 		title, _ := item.Data["title"].(string)
 		infoHash, _ := item.Data["info_hash"].(string)
 		if JobMatchesTorrent(infoHash, title, t.Hash, t.Name) {
@@ -116,7 +139,15 @@ func (w *Watcher) hasMatchingJob(t qbit.Torrent) bool {
 
 // importTorrent auto-imports a completed torrent into the library.
 func (w *Watcher) importTorrent(t qbit.Torrent) {
-	defer w.processing.Delete(t.Hash)
+	key := torrentHashClaim(torrentClientForTorrent(t), t.Hash)
+	if key == "" {
+		key = torrentHashClaim(torrentClientForTorrent(t), "title:"+t.Name)
+	}
+	w.importTorrentWithKey(t, key)
+}
+
+func (w *Watcher) importTorrentWithKey(t qbit.Torrent, key string) {
+	defer w.processing.Delete(key)
 
 	slog.Info("watcher: auto-importing completed torrent", "name", t.Name, "hash", t.Hash)
 
@@ -138,6 +169,7 @@ func (w *Watcher) importTorrent(t qbit.Torrent) {
 		"status":        "organizing",
 		"title":         t.Name,
 		"info_hash":     t.Hash,
+		"download_client": t.Client,
 		"platform":      platf,
 		"platform_slug": platSlug,
 		"is_pc":         isPC,
@@ -146,11 +178,11 @@ func (w *Watcher) importTorrent(t qbit.Torrent) {
 	})
 
 	if w.mgr.importFinishedTorrent("watcher", jobID, t, platf, platSlug, isPC) {
-		w.imported.Store(t.Hash, struct{}{})
+		w.imported.Store(key, struct{}{})
 
 		// Optionally remove the torrent after import.
 		if w.cfg.RemoveAfterImport {
-			w.mgr.QB().DeleteTorrent(t.Hash, false)
+			w.mgr.removeTorrent(t, false)
 			slog.Info("watcher: removed torrent after import", "name", t.Name)
 		}
 
@@ -165,5 +197,5 @@ func (w *Watcher) importTorrent(t qbit.Torrent) {
 	// Bounded rather than disabled. The guard this replaces was right that a
 	// broken import must not spin forever, but it could not tell a transient miss
 	// from a permanent one and so treated every failure as permanent.
-	w.imported.Store(t.Hash, struct{}{})
+	w.imported.Store(key, struct{}{})
 }

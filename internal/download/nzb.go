@@ -460,7 +460,7 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 	if hash == "" {
 		return false, "This job has no torrent recorded, so there is nothing to import again"
 	}
-	torrent, found, err := m.torrentByHash(hash)
+	torrent, found, err := m.torrentByHash(hash, torrentClientFromJob(job))
 	if err != nil {
 		return false, fmt.Sprintf("Cannot read the download client: %v", err)
 	}
@@ -474,7 +474,7 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 	// Advisory only. The import's own claim is what excludes a second one; this
 	// just answers with the specific reason before touching the row, since the
 	// status alone cannot say whether an import is running.
-	if _, busy := m.importing.Load(torrent.Hash); busy {
+	if _, busy := m.importing.Load(torrentImportClaim(torrent, jobID, job)); busy {
 		return false, "An import is already running for this download"
 	}
 

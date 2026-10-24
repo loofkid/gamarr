@@ -26,6 +26,11 @@ type Torrent struct {
 	ETA         int     `json:"eta"`
 	SavePath    string  `json:"save_path"`
 	ContentPath string  `json:"content_path"`
+	// Client identifies the torrent backend when the download package normalizes
+	// another client's API into this shared representation.
+	Client string `json:"-"`
+	// Labels contains backend labels used to scope managed torrents.
+	Labels []string `json:"-"`
 }
 
 // TorrentFile represents a file within a torrent.

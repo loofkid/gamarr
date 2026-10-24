@@ -29,7 +29,12 @@ var archQualifiers = map[string]bool{
 
 // ScanTorrentFileList checks a torrent's file list for dangerous extensions.
 func ScanTorrentFileList(qb *qbit.Client, torrentHash string) (bool, []string) {
-	files := qb.GetTorrentFiles(torrentHash)
+	return ScanTorrentFiles(qb.GetTorrentFiles(torrentHash))
+}
+
+// ScanTorrentFiles checks a normalized torrent file list for dangerous files,
+// regardless of which download client supplied it.
+func ScanTorrentFiles(files []qbit.TorrentFile) (bool, []string) {
 	if len(files) == 0 {
 		return true, nil // Can't check, assume OK
 	}

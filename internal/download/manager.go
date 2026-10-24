@@ -50,15 +50,15 @@ type Manager struct {
 	sab          *sabnzbd.Client
 	NotifyFunc   NotifyCallback
 
-	// importing holds the download hashes an import is running for. Two imports
-	// of one download race for its path: whichever moves it first wins, and the
+	// importing holds backend-scoped torrent identities an import is running for.
+	// Two imports of one download race for its path: whichever moves it first wins, and the
 	// loser stats the emptied path, reads it as missing and writes a failure
 	// blaming the user's mounts. Keyed by hash rather than job id because
 	// OrganizeTorrent mints a fresh job per call, so two rows can name one
 	// physical download.
 	importing sync.Map
 
-	// watching holds the download hashes a watcher goroutine is polling for.
+	// watching holds backend-scoped torrent identities a watcher goroutine polls.
 	// Keyed by hash rather than job id, and deliberately not inferred from the
 	// job row: a row is persisted and outlives the process, while the goroutine
 	// does not, so after a restart every row needs a watcher again and the row
@@ -198,10 +198,14 @@ func (m *Manager) DownloadTorrent(url, infoHash, title, platf, platSlug string, 
 	// Try Transmission.
 	if !added && m.transmission != nil {
 		m.jobs.Update(jobID, "detail", "Sending to Transmission...")
-		_, err := m.transmission.AddTorrent(url, m.cfg.QBSavePath)
+		addedTorrent, err := m.transmission.AddTorrent(url, m.cfg.QBSavePath)
 		if err == nil {
 			added = true
-			clientUsed = "Transmission"
+			clientUsed = transmissionClientName
+			if hash := transmissionString(addedTorrent, "hashString", "hash_string"); hash != "" {
+				infoHash = strings.ToLower(hash)
+				m.jobs.Update(jobID, "info_hash", infoHash)
+			}
 		} else {
 			slog.Warn("Transmission add failed", "title", title, "error", err)
 		}
@@ -230,6 +234,13 @@ func (m *Manager) DownloadTorrent(url, infoHash, title, platf, platSlug string, 
 		return jobID, nil
 	}
 
+	trackingClient := clientUsed
+	if clientUsed != transmissionClientName {
+		// Keep legacy fallback behavior for clients that do not yet have their
+		// own completion adapter; only Transmission is newly tracked independently.
+		trackingClient = qbittorrentClientName
+	}
+	m.jobs.Update(jobID, "download_client", trackingClient)
 	m.jobs.Update(jobID, "detail", fmt.Sprintf("Downloading via %s...", clientUsed))
 	slog.Info("torrent added", "client", clientUsed, "title", title)
 
@@ -240,7 +251,7 @@ func (m *Manager) DownloadTorrent(url, infoHash, title, platf, platSlug string, 
 		// repack's release title and torrent name have nothing in common. The
 		// client knows the hash, so ask it rather than giving up the binding.
 		// Off the request path because it polls.
-		if hash == "" && clientUsed == "qBittorrent" {
+		if hash == "" && clientUsed == qbittorrentClientName {
 			if resolved, ok := m.resolveAddedHash(knownBefore, title); ok {
 				hash = resolved
 				m.jobs.Update(jobID, "info_hash", resolved)
@@ -249,20 +260,37 @@ func (m *Manager) DownloadTorrent(url, infoHash, title, platf, platSlug string, 
 				slog.Warn("no infohash from client, matching on title", "title", title)
 			}
 		}
-		if selectFiles && clientUsed == "qBittorrent" && hash != "" {
-			m.maybeRenameArchiveTorrent(hash, platf, platSlug)
+		if selectFiles && (clientUsed == qbittorrentClientName || clientUsed == transmissionClientName) && hash != "" {
+			if clientUsed == qbittorrentClientName {
+				m.maybeRenameArchiveTorrent(hash, platf, platSlug)
+			}
 			m.jobs.Update(jobID, "detail", "Selecting files in archive torrent...")
-			if err := m.selectArchiveFiles(hash, title, jobID); err != nil {
-				slog.Warn("archive file selection failed", "title", title, "hash", hash, "error", err)
+			selectionErr := m.selectArchiveFiles(hash, title, jobID, trackingClient)
+			if selectionErr != nil {
+				slog.Warn("archive file selection failed", "title", title, "hash", hash, "error", selectionErr)
+				if clientUsed == transmissionClientName {
+					m.jobs.UpdateMulti(jobID, map[string]interface{}{
+						"status": "error",
+						"error":  selectionErr.Error(),
+						"detail": "Transmission archive paused because file selection failed",
+					})
+					return
+				}
 			} else {
 				for _, item := range m.jobs.Items() {
 					ih, _ := item.Data["info_hash"].(string)
-					if strings.EqualFold(ih, hash) {
+					if strings.EqualFold(ih, hash) && strings.EqualFold(torrentClientFromJob(item.Data), trackingClient) {
 						m.jobs.Update(item.ID, "detail", "Downloading...")
 					}
 				}
 			}
-			m.qb.StartTorrent(hash)
+			if clientUsed == transmissionClientName {
+				if err := m.transmission.StartTorrent(hash); err != nil {
+					slog.Warn("could not resume Transmission archive torrent", "title", title, "hash", hash, "error", err)
+				}
+			} else if m.qb != nil {
+				m.qb.StartTorrent(hash)
+			}
 		}
 		m.watchGameTorrent(jobID, hash, title, platf, platSlug, isPC)
 	}()
@@ -289,10 +317,10 @@ func (m *Manager) hashInCategory(infoHash string) bool {
 
 // selectArchiveFiles waits for metadata, then sets file priorities so only the
 // ROM matching title (plus files wanted by other active jobs on this hash) download.
-func (m *Manager) selectArchiveFiles(hash, title, jobID string) error {
-	files := m.waitTorrentFiles(hash)
-	if files == nil {
-		return fmt.Errorf("file list unavailable")
+func (m *Manager) selectArchiveFiles(hash, title, jobID, clientName string) error {
+	files, err := m.waitTorrentFiles(hash, clientName)
+	if err != nil {
+		return err
 	}
 	if len(files) <= 1 {
 		return nil
@@ -320,6 +348,9 @@ func (m *Manager) selectArchiveFiles(hash, title, jobID string) error {
 		if !strings.EqualFold(ih, hash) {
 			continue
 		}
+		if !strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
+			continue
+		}
 		otherTitle, _ := item.Data["title"].(string)
 		for _, idx := range matchTorrentFileIndexes(files, otherTitle) {
 			wanted[idx] = true
@@ -334,11 +365,23 @@ func (m *Manager) selectArchiveFiles(hash, title, jobID string) error {
 			skip = append(skip, idx)
 		}
 	}
-	if len(skip) > 0 && !m.qb.SetFilePriority(hash, skip, 0) {
-		return fmt.Errorf("failed to skip %d files", len(skip))
-	}
-	if len(keep) > 0 && !m.qb.SetFilePriority(hash, keep, 1) {
-		return fmt.Errorf("failed to enable %d files", len(keep))
+	if strings.EqualFold(clientName, transmissionClientName) {
+		if m.transmission == nil {
+			return fmt.Errorf("Transmission is not configured")
+		}
+		if err := m.transmission.SetFileSelection(hash, keep, skip); err != nil {
+			return fmt.Errorf("Transmission file selection failed: %w", err)
+		}
+	} else {
+		if m.qb == nil {
+			return fmt.Errorf("qBittorrent is not configured")
+		}
+		if len(skip) > 0 && !m.qb.SetFilePriority(hash, skip, 0) {
+			return fmt.Errorf("failed to skip %d files", len(skip))
+		}
+		if len(keep) > 0 && !m.qb.SetFilePriority(hash, keep, 1) {
+			return fmt.Errorf("failed to enable %d files", len(keep))
+		}
 	}
 	slog.Info("archive file selection applied", "hash", hash, "title", title, "keep", len(keep), "skip", len(skip))
 	return nil
@@ -391,15 +434,34 @@ func (m *Manager) maybeRenameArchiveTorrent(hash, platf, platSlug string) {
 	}
 }
 
-func (m *Manager) waitTorrentFiles(hash string) []qbit.TorrentFile {
-	for attempt := 0; attempt < 60; attempt++ {
-		files := m.qb.GetTorrentFiles(hash)
-		if len(files) > 0 {
-			return files
-		}
-		time.Sleep(500 * time.Millisecond)
+func (m *Manager) waitTorrentFiles(hash, clientName string) ([]qbit.TorrentFile, error) {
+	interval := 500 * time.Millisecond
+	attempts := 60
+	if strings.EqualFold(clientName, transmissionClientName) {
+		// Transmission magnet torrents need to run to retrieve metadata. Poll
+		// frequently, then stop as soon as the file list appears so selection is
+		// applied before the main download resumes.
+		interval = 200 * time.Millisecond
+		attempts = 150
 	}
-	return m.qb.GetTorrentFiles(hash)
+	for attempt := 0; attempt < attempts; attempt++ {
+		files := m.torrentFiles(qbit.Torrent{Hash: hash, Client: clientName})
+		if len(files) > 0 {
+			if strings.EqualFold(clientName, transmissionClientName) {
+				if err := m.transmission.StopTorrent(hash); err != nil {
+					return nil, fmt.Errorf("could not pause Transmission after metadata became available: %w", err)
+				}
+			}
+			return files, nil
+		}
+		time.Sleep(interval)
+	}
+	if strings.EqualFold(clientName, transmissionClientName) {
+		if err := m.transmission.StopTorrent(hash); err != nil {
+			return nil, fmt.Errorf("file list unavailable and Transmission could not be paused: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("file list unavailable")
 }
 
 // matchTorrentFileIndexes returns torrent file indexes whose basename matches
@@ -544,18 +606,44 @@ func (m *Manager) DownloadDDL(url, vimmID, title, platf, platSlug string, isPC b
 
 // OrganizeTorrent manually triggers organize for a completed torrent.
 func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (string, error) {
-	torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
-	if err != nil {
-		return "", fmt.Errorf("cannot read the download client: %w", err)
-	}
 	var torrent *qbit.Torrent
-	for i := range torrents {
-		if torrents[i].Hash == hash {
-			torrent = &torrents[i]
+	var lastErr error
+	readSucceeded := false
+	clients := make([]string, 0, 2)
+	preferredClient := m.preferredTorrentClientForHash(hash)
+	for _, clientName := range []string{preferredClient, qbittorrentClientName, transmissionClientName} {
+		if clientName == "" || stringInSliceFold(clients, clientName) {
+			continue
+		}
+		if strings.EqualFold(clientName, qbittorrentClientName) && m.cfg.HasQBittorrent() ||
+			strings.EqualFold(clientName, transmissionClientName) && m.cfg.HasTransmission() {
+			clients = append(clients, clientName)
+		}
+	}
+	for _, clientName := range clients {
+		torrents, err := m.torrentsForClient(clientName)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		readSucceeded = true
+		for i := range torrents {
+			if strings.EqualFold(torrents[i].Hash, hash) {
+				torrent = &torrents[i]
+				break
+			}
+		}
+		if torrent != nil {
 			break
 		}
 	}
 	if torrent == nil {
+		if lastErr != nil && !readSucceeded {
+			return "", fmt.Errorf("cannot read the download client: %w", lastErr)
+		}
+		if len(clients) == 0 {
+			return "", fmt.Errorf("no torrent download client is configured")
+		}
 		return "", fmt.Errorf("torrent not found")
 	}
 	if torrent.Progress < 1.0 {
@@ -573,6 +661,7 @@ func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (stri
 		"status":          "organizing",
 		"title":           torrent.Name,
 		"info_hash":       torrent.Hash,
+		"download_client": torrent.Client,
 		"platform":        platf,
 		"platform_slug":   platSlug,
 		"platform_source": platformSourceManual,
@@ -587,11 +676,44 @@ func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (stri
 	return jobID, nil
 }
 
+func stringInSliceFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// preferredTorrentClientForHash uses a completed-unorganized job as the best
+// signal for manual organize. Otherwise it preserves qBittorrent-first behavior
+// when duplicate copies exist, then falls back to whichever client is tracked.
+func (m *Manager) preferredTorrentClientForHash(hash string) string {
+	preferred := ""
+	preferredUnorganized := false
+	for _, item := range m.jobs.Items() {
+		jobHash, _ := item.Data["info_hash"].(string)
+		if !strings.EqualFold(jobHash, hash) {
+			continue
+		}
+		clientName := torrentClientFromJob(item.Data)
+		status, _ := item.Data["status"].(string)
+		unorganized := status == "completed_unorganized"
+		if preferred == "" ||
+			unorganized && !preferredUnorganized ||
+			unorganized == preferredUnorganized && strings.EqualFold(clientName, qbittorrentClientName) && !strings.EqualFold(preferred, qbittorrentClientName) {
+			preferred = clientName
+			preferredUnorganized = unorganized
+		}
+	}
+	return preferred
+}
+
 // torrentWantedComplete reports whether every selected file in a torrent has
 // finished. Whole-torrent progress reads 100% once the wanted subset is done,
 // but multi-file Minerva archives share one hash across many ROM jobs.
 func (m *Manager) torrentWantedComplete(t *qbit.Torrent) bool {
-	files := m.qb.GetTorrentFiles(t.Hash)
+	files := m.torrentFiles(*t)
 	if len(files) > 1 {
 		hasWanted := false
 		for _, f := range files {
@@ -618,7 +740,7 @@ func (m *Manager) jobFileReady(job map[string]interface{}, torrent qbit.Torrent)
 	if title == "" || strings.EqualFold(title, torrent.Name) || isGenericArchiveTorrentName(title) {
 		return torrent.Progress >= 1.0 || torrent.State == "stoppedUP"
 	}
-	files := m.qb.GetTorrentFiles(torrent.Hash)
+	files := m.torrentFiles(torrent)
 	if len(files) == 0 {
 		// GetTorrentFiles returns nil on any read error, so an empty listing is a
 		// failed read, not a torrent without files. A member job cannot be judged
@@ -647,13 +769,16 @@ func (m *Manager) jobFileReady(job map[string]interface{}, torrent qbit.Torrent)
 // files are ready. Minerva archive magnets share one hash; each ROM finishes on
 // its own schedule. Returns true when no active jobs remain on the hash.
 func (m *Manager) importReadyHashJobs(t qbit.Torrent, triggerJobID, defaultPlatf, defaultPlatSlug string, defaultPC bool) bool {
-	jobs := m.jobsOnHash(t.Hash)
+	clientName := torrentClientForTorrent(t)
+	jobs := m.jobsOnHash(t.Hash, clientName)
 	if triggerJobID != "" && !jobInList(jobs, triggerJobID) {
 		if job, ok := m.jobs.Get(triggerJobID); ok {
-			jobs = append(jobs, struct {
-				ID   string
-				Data map[string]interface{}
-			}{ID: triggerJobID, Data: job})
+			if strings.EqualFold(torrentClientFromJob(job), clientName) {
+				jobs = append(jobs, struct {
+					ID   string
+					Data map[string]interface{}
+				}{ID: triggerJobID, Data: job})
+			}
 		}
 	}
 	if len(jobs) == 0 {
@@ -674,16 +799,13 @@ func (m *Manager) importReadyHashJobs(t qbit.Torrent, triggerJobID, defaultPlatf
 		case "scanning", "organizing":
 			continue
 		}
-		claim := t.Hash
-		jobTitle, _ := j.Data["title"].(string)
-		if jobTitle != "" && !strings.EqualFold(jobTitle, t.Name) && !isGenericArchiveTorrentName(jobTitle) {
-			claim = j.ID
-		}
+		claim := torrentImportClaim(t, j.ID, j.Data)
 		if _, busy := m.importing.Load(claim); busy {
 			continue
 		}
 		platf, platSlug, isPC := jobImportContext(j.Data, defaultPlatf, defaultPlatSlug, defaultPC)
 		via := "job watch"
+		jobTitle, _ := j.Data["title"].(string)
 		if jobTitle != "" && !strings.EqualFold(jobTitle, t.Name) && !isGenericArchiveTorrentName(jobTitle) {
 			via = "archive watch"
 		}
@@ -741,7 +863,7 @@ func jobImportContext(data map[string]interface{}, defaultPlatf, defaultPlatSlug
 	return platf, platSlug, isPC
 }
 
-func (m *Manager) jobsOnHash(hash string) []struct {
+func (m *Manager) jobsOnHash(hash, clientName string) []struct {
 	ID   string
 	Data map[string]interface{}
 } {
@@ -754,7 +876,7 @@ func (m *Manager) jobsOnHash(hash string) []struct {
 	}
 	for _, item := range m.jobs.Items() {
 		ih, _ := item.Data["info_hash"].(string)
-		if strings.EqualFold(ih, hash) {
+		if strings.EqualFold(ih, hash) && strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
 			out = append(out, item)
 		}
 	}
@@ -781,7 +903,7 @@ func (m *Manager) resolveImportContentPath(jobID string, torrent *qbit.Torrent) 
 	if jobTitle == "" || strings.EqualFold(jobTitle, torrentName) || isGenericArchiveTorrentName(jobTitle) {
 		return contentPath
 	}
-	files := m.qb.GetTorrentFiles(torrent.Hash)
+	files := m.torrentFiles(*torrent)
 	if len(files) <= 1 {
 		return contentPath
 	}
@@ -805,10 +927,10 @@ func torrentFileContentPath(contentPath, fileName string) string {
 
 // shouldFinishTorrent reports whether the client may drop this torrent after an
 // import. Archive magnets keep seeding until every ROM job on the hash finishes.
-func (m *Manager) shouldFinishTorrent(hash, torrentName string) bool {
+func (m *Manager) shouldFinishTorrent(clientName, hash, torrentName string) bool {
 	for _, item := range m.jobs.Items() {
 		ih, _ := item.Data["info_hash"].(string)
-		if !strings.EqualFold(ih, hash) {
+		if !strings.EqualFold(ih, hash) || !strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
 			continue
 		}
 		title, _ := item.Data["title"].(string)
@@ -825,11 +947,11 @@ func (m *Manager) shouldFinishTorrent(hash, torrentName string) bool {
 	return true
 }
 
-// RecoverActiveTorrentJobs reconnects watchers for persisted qBittorrent jobs
-// after a Gamarr restart. The client still owns the transfer; only the in-process
-// goroutine was lost.
+// RecoverActiveTorrentJobs reconnects watchers for persisted torrent jobs after
+// a Gamarr restart. The configured client still owns the transfer; only the
+// in-process goroutine was lost.
 func (m *Manager) RecoverActiveTorrentJobs() {
-	if !m.cfg.HasQBittorrent() {
+	if !m.cfg.HasQBittorrent() && !m.cfg.HasTransmission() {
 		return
 	}
 	seen := map[string]bool{}
@@ -843,14 +965,24 @@ func (m *Manager) RecoverActiveTorrentJobs() {
 		if status != "downloading" && status != "interrupted" {
 			continue
 		}
-		if seen[hash] {
+		title, _ := item.Data["title"].(string)
+		clientName := torrentClientFromJob(item.Data)
+		if strings.EqualFold(clientName, transmissionClientName) && !m.cfg.HasTransmission() {
+			slog.Warn("cannot recover Transmission job because Transmission is not configured", "title", title)
+			continue
+		}
+		if !strings.EqualFold(clientName, transmissionClientName) && !m.cfg.HasQBittorrent() {
+			slog.Warn("cannot recover qBittorrent job because qBittorrent is not configured", "title", title)
+			continue
+		}
+		claim := strings.ToLower(clientName) + ":" + hash
+		if seen[claim] {
 			if detail, _ := item.Data["detail"].(string); detail == "Selecting files in archive torrent..." {
 				m.jobs.Update(item.ID, "detail", "Downloading (shared torrent)...")
 			}
 			continue
 		}
-		seen[hash] = true
-		title, _ := item.Data["title"].(string)
+		seen[claim] = true
 		platf, _ := item.Data["platform"].(string)
 		platSlug, _ := item.Data["platform_slug"].(string)
 		isPC, _ := item.Data["is_pc"].(bool)
@@ -871,9 +1003,13 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 	// otherwise start a rival watcher on a torrent already being watched and both
 	// would race to import it. The title fallback covers indexers that report no
 	// infohash, matching what JobMatchesTorrent does.
-	claim := strings.ToLower(infoHash)
+	clientName := qbittorrentClientName
+	if job, ok := m.jobs.Get(jobID); ok {
+		clientName = torrentClientFromJob(job)
+	}
+	claim := torrentHashClaim(clientName, infoHash)
 	if claim == "" {
-		claim = "title:" + strings.ToLower(title)
+		claim = strings.ToLower(clientName) + ":title:" + strings.ToLower(title)
 	}
 	if _, busy := m.watching.LoadOrStore(claim, struct{}{}); busy {
 		m.jobs.Update(jobID, "detail", "Downloading (shared torrent)...")
@@ -888,7 +1024,7 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 	fileScanDone := false
 
 	for time.Since(start) < maxWait {
-		torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+		torrents, err := m.torrentsForClient(clientName)
 		if err != nil {
 			slog.Warn("could not read the download client", "title", title, "error", err)
 			time.Sleep(5 * time.Second)
@@ -903,7 +1039,7 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 			// Layer 1: scan file list once metadata is available
 			if m.cfg.FileListScanEnabled && !fileScanDone && t.Progress > 0 {
 				m.jobs.Update(jobID, "detail", "Scanning file list...")
-				isSafe, issues := safety.ScanTorrentFileList(m.qb, t.Hash)
+				isSafe, issues := safety.ScanTorrentFiles(m.torrentFiles(t))
 				fileScanDone = true
 				if !isSafe {
 					slog.Warn("file list scan failed", "title", title, "issues", issues)
@@ -911,7 +1047,7 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 					// or run; deleting them throws away a download the
 					// operator may well consider legitimate.
 					detail := "Dangerous files detected - torrent stopped for review"
-					if !m.qb.StopTorrent(t.Hash) {
+					if !m.stopTorrent(t) {
 						slog.Error("could not stop torrent after failed file list scan", "title", title, "hash", t.Hash)
 						detail = "Dangerous files detected - could not stop the torrent, review it in your client"
 					}
@@ -1212,8 +1348,8 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 		return false // Don't delete torrent
 	}
 
-	if m.shouldFinishTorrent(torrentHash, torrentName) {
-		m.finishTorrent(torrentHash, torrentName, importMode)
+	if m.shouldFinishTorrent(torrentClientForTorrent(torrent), torrentHash, torrentName) {
+		m.finishTorrent(torrent.Client, torrentHash, torrentName, importMode)
 	}
 	return false
 }
@@ -1324,7 +1460,7 @@ func (m *Manager) wantedFiles(torrent *qbit.Torrent) (fileops.WantedFiles, bool)
 	if torrent.Hash == "" {
 		return nil, true
 	}
-	files := m.qb.GetTorrentFiles(torrent.Hash)
+	files := m.torrentFiles(*torrent)
 	if len(files) == 0 {
 		slog.Error("torrent file list unavailable, importing without a selection",
 			"hash", torrent.Hash, "name", sanitizeLog(torrent.Name))
@@ -1402,13 +1538,23 @@ func acceptOccupiedVault(base, src string, wanted fileops.WantedFiles) (dest str
 // torrent is still seedable — removing it (or its files) would throw away the
 // ratio the user imported this way to keep, so it is left alone unless
 // REMOVE_TORRENT_AFTER_IMPORT asks otherwise, and even then the files stay.
-func (m *Manager) finishTorrent(hash, name string, mode fileops.Mode) {
+func (m *Manager) finishTorrent(clientName, hash, name string, mode fileops.Mode) {
+	torrent := qbit.Torrent{Hash: hash, Name: name, Client: clientName}
+	if strings.EqualFold(clientName, transmissionClientName) {
+		// A move-mode import has already moved the source files out of Transmission's
+		// download directory; in every mode, deleting from Transmission must keep
+		// the data because Gamarr's import policy, not the client, owns that choice.
+		if !mode.PreservesSource() || m.cfg.RemoveAfterImport {
+			m.removeTorrent(torrent, false)
+		}
+		return
+	}
 	if !mode.PreservesSource() {
-		m.qb.DeleteTorrent(hash, true)
+		m.removeTorrent(torrent, true)
 		return
 	}
 	if m.cfg.RemoveAfterImport {
-		m.qb.DeleteTorrent(hash, false)
+		m.removeTorrent(torrent, false)
 		slog.Info("removed torrent after import, files kept", "name", sanitizeLog(name), "mode", string(mode))
 		return
 	}
@@ -1461,15 +1607,8 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 	// excluded rather than only the one that was looked at. The hash is what two
 	// rows naming one download share; archive ROM jobs on that hash import
 	// different files and claim by job id instead.
-	claim := t.Hash
-	if claim == "" {
-		claim = jobID
-	} else if job, ok := m.jobs.Get(jobID); ok {
-		jobTitle, _ := job["title"].(string)
-		if jobTitle != "" && !strings.EqualFold(jobTitle, t.Name) && !isGenericArchiveTorrentName(jobTitle) {
-			claim = jobID
-		}
-	}
+	job, _ := m.jobs.Get(jobID)
+	claim := torrentImportClaim(t, jobID, job)
 	if _, busy := m.importing.LoadOrStore(claim, struct{}{}); busy {
 		slog.Warn("an import is already running for this download", "via", via, "name", sanitizeLog(t.Name))
 		// A refusal has to leave a row the user can act on: left at organizing
@@ -1518,7 +1657,7 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 
 		// Ask the client again rather than reusing the value that just failed:
 		// content_path changes when the client publishes the finished download.
-		fresh, found, err := m.torrentByHash(t.Hash)
+		fresh, found, err := m.torrentByHash(t.Hash, t.Client)
 		switch {
 		case err != nil:
 			slog.Warn("could not re-read the torrent, trying again",
@@ -1548,8 +1687,8 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 // anything only when the error is nil: a read that failed is not evidence the
 // client stopped holding the torrent, and acting on it as though it were turns
 // one bad request into a permanent give-up.
-func (m *Manager) torrentByHash(hash string) (qbit.Torrent, bool, error) {
-	torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+func (m *Manager) torrentByHash(hash, clientName string) (qbit.Torrent, bool, error) {
+	torrents, err := m.torrentsForClient(clientName)
 	if err != nil {
 		return qbit.Torrent{}, false, err
 	}
@@ -1583,7 +1722,7 @@ func (m *Manager) organizeWithScan(jobID string, torrent *qbit.Torrent, platf, p
 			"error":  fmt.Sprintf("Virus detected: %s", strings.Join(detail, "; ")),
 			"detail": "Infected files found - download quarantined",
 		})
-		m.qb.DeleteTorrent(torrent.Hash, true)
+		m.removeTorrent(*torrent, true)
 		return false
 	}
 	m.jobs.UpdateMulti(jobID, map[string]interface{}{
@@ -2325,13 +2464,16 @@ func (m *Manager) organizeDDLFile(jobID, fp, title, platf, platSlug string, isPC
 
 // dismissArchiveShellJobs drops torrent-named shell jobs once real ROM jobs
 // share the same infohash (orphan recovery used to mint these for Minerva).
-func (m *Manager) dismissArchiveShellJobs(hash, torrentName string) {
+func (m *Manager) dismissArchiveShellJobs(hash, torrentName, clientName string) {
 	if hash == "" {
 		return
 	}
 	hasROM := false
 	var shells []string
 	for _, item := range m.jobs.Items() {
+		if !strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
+			continue
+		}
 		ih, _ := item.Data["info_hash"].(string)
 		if !strings.EqualFold(ih, hash) {
 			continue
@@ -2355,8 +2497,11 @@ func (m *Manager) dismissArchiveShellJobs(hash, torrentName string) {
 	}
 }
 
-func (m *Manager) archivePlatformForHash(hash string) (platf, platSlug string) {
+func (m *Manager) archivePlatformForHash(hash, clientName string) (platf, platSlug string) {
 	for _, item := range m.jobs.Items() {
+		if !strings.EqualFold(torrentClientFromJob(item.Data), clientName) {
+			continue
+		}
 		ih, _ := item.Data["info_hash"].(string)
 		if !strings.EqualFold(ih, hash) {
 			continue
@@ -2406,15 +2551,15 @@ func (m *Manager) RecoverOrphanedTorrents() {
 	}
 
 	for _, t := range torrents {
-		m.dismissArchiveShellJobs(t.Hash, t.Name)
+		m.dismissArchiveShellJobs(t.Hash, t.Name, qbittorrentClientName)
 		if isGenericArchiveTorrentName(t.Name) {
-			platf, platSlug := m.archivePlatformForHash(t.Hash)
+			platf, platSlug := m.archivePlatformForHash(t.Hash, qbittorrentClientName)
 			m.maybeRenameArchiveTorrent(t.Hash, platf, platSlug)
 		}
 		// Reuse the row already tracking this torrent. Recovery is not a
 		// once-per-install routine, so minting an id per pass accumulated a
 		// duplicate row per torrent every time it ran.
-		jobID, known := m.jobForTorrent(t.Hash, t.Name)
+		jobID, known := m.jobForTorrent(t.Hash, t.Name, qbittorrentClientName)
 		if known {
 			// A finished import is terminal, and organizeGame leaves the torrent
 			// seeding under a source-preserving import, so a game already in the
@@ -2432,7 +2577,7 @@ func (m *Manager) RecoverOrphanedTorrents() {
 					continue
 				}
 			}
-		} else if m.infoHashTracked(t.Hash) {
+		} else if m.infoHashTracked(t.Hash, qbittorrentClientName) {
 			continue
 		} else {
 			jobID = newJobID()
@@ -2457,26 +2602,28 @@ func (m *Manager) RecoverOrphanedTorrents() {
 
 		if t.Progress >= 1.0 {
 			m.jobs.Set(jobID, map[string]interface{}{
-				"status":        "completed_unorganized",
-				"title":         t.Name,
-				"info_hash":     t.Hash,
-				"platform":      platf,
-				"platform_slug": platSlug,
-				"is_pc":         isPC,
-				"error":         nil,
-				"detail":        "Completed - needs organizing (use organize button)",
+				"status":          "completed_unorganized",
+				"title":           t.Name,
+				"info_hash":       t.Hash,
+				"download_client": qbittorrentClientName,
+				"platform":        platf,
+				"platform_slug":   platSlug,
+				"is_pc":           isPC,
+				"error":           nil,
+				"detail":          "Completed - needs organizing (use organize button)",
 			})
 			slog.Info("recovered completed torrent", "name", t.Name)
 		} else {
 			m.jobs.Set(jobID, map[string]interface{}{
-				"status":        "downloading",
-				"title":         t.Name,
-				"info_hash":     t.Hash,
-				"platform":      platf,
-				"platform_slug": platSlug,
-				"is_pc":         isPC,
-				"error":         nil,
-				"detail":        "Recovered - watching download...",
+				"status":          "downloading",
+				"title":           t.Name,
+				"info_hash":       t.Hash,
+				"download_client": qbittorrentClientName,
+				"platform":        platf,
+				"platform_slug":   platSlug,
+				"is_pc":           isPC,
+				"error":           nil,
+				"detail":          "Recovered - watching download...",
 			})
 			go m.watchGameTorrent(jobID, t.Hash, t.Name, platf, platSlug, isPC)
 			slog.Info("recovered in-progress torrent", "name", t.Name, "progress", fmt.Sprintf("%.0f%%", t.Progress*100))

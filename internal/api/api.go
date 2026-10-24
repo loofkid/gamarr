@@ -654,23 +654,36 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 		"pausedUP": "completed", "queuedUP": "completed",
 		"checkingDL": "checking", "checkingUP": "checking",
 		"stoppedDL": "paused",
-		"error":     "error", "missingFiles": "error",
+		"error": "error", "missingFiles": "error",
+		"queuedVerify": "checking", "checking": "checking",
+		"seeding": "completed", "stopped": "paused",
 	}
 
 	matchedJobIDs := make(map[string]bool)
 
-	// Active torrents from qBit, when configured. Jobs from other download
-	// clients are still returned below.
-	var torrents []qbit.Torrent
-	if s.cfg.HasQBittorrent() {
-		var err error
-		if torrents, err = s.mgr.QB().GetTorrents(s.cfg.QBCategory); err != nil {
-			slog.Warn("could not read torrents from the download client", "error", err)
-		}
-	}
 	jobs := s.mgr.Jobs()
+	// Active torrents from each configured client. When both clients hold one
+	// hash, prefer its active tracked owner and preserve qBittorrent precedence
+	// only when both owners have the same activity state.
+	torrents := s.mgr.ConfiguredTorrents()
+	jobClientByHash := preferredTorrentOwners(jobs.Items())
+	seenTorrentHashes := make(map[string]bool)
 
 	for _, tor := range torrents {
+		if owner := jobClientByHash[strings.ToLower(tor.Hash)]; owner != "" && !strings.EqualFold(owner, tor.Client) {
+			continue
+		}
+		if strings.EqualFold(tor.Client, "Transmission") &&
+			!download.IsGamarrManagedTransmissionTorrent(tor) &&
+			!strings.EqualFold(jobClientByHash[strings.ToLower(tor.Hash)], "Transmission") {
+			continue
+		}
+		if tor.Hash != "" {
+			if seenTorrentHashes[strings.ToLower(tor.Hash)] {
+				continue
+			}
+			seenTorrentHashes[strings.ToLower(tor.Hash)] = true
+		}
 		progress := float64(int(tor.Progress*1000)) / 10.0
 		speed := search.HumanSize(tor.DLSpeed) + "/s"
 
@@ -693,11 +706,14 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 			jobHash, _ := item.Data["info_hash"].(string)
 			if jobHash != "" {
 				if strings.EqualFold(jobHash, tor.Hash) {
+					if !strings.EqualFold(downloadTorrentClient(item.Data), tor.Client) {
+						continue
+					}
 					hashJobs = append(hashJobs, item)
 				}
 				continue
 			}
-			if titleJob == nil && download.JobMatchesTorrent(jobHash, jobTitle, tor.Hash, tor.Name) {
+			if titleJob == nil && strings.EqualFold(downloadTorrentClient(item.Data), tor.Client) && download.JobMatchesTorrent(jobHash, jobTitle, tor.Hash, tor.Name) {
 				j := item
 				titleJob = &j
 			}
@@ -733,7 +749,7 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Unmatched jobs — group leftovers that share an infohash into one card.
+	// Unmatched jobs — group leftovers that share an infohash in the same client.
 	byHash := map[string][]struct {
 		ID   string
 		Data map[string]interface{}
@@ -748,7 +764,7 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 		}
 		infoHash, _ := item.Data["info_hash"].(string)
 		if infoHash != "" {
-			key := strings.ToLower(infoHash)
+			key := strings.ToLower(downloadTorrentClient(item.Data)) + ":" + strings.ToLower(infoHash)
 			byHash[key] = append(byHash[key], item)
 			continue
 		}
@@ -785,6 +801,45 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, map[string]interface{}{"downloads": downloads})
+}
+
+func downloadTorrentClient(data map[string]interface{}) string {
+	client, _ := data["download_client"].(string)
+	if strings.TrimSpace(client) == "" {
+		return "qBittorrent"
+	}
+	return client
+}
+
+func preferredTorrentOwners(jobs []struct {
+	ID   string
+	Data map[string]interface{}
+}) map[string]string {
+	type owner struct {
+		client string
+		active bool
+	}
+	owners := make(map[string]owner)
+	for _, item := range jobs {
+		hash, _ := item.Data["info_hash"].(string)
+		if hash == "" {
+			continue
+		}
+		client := downloadTorrentClient(item.Data)
+		status, _ := item.Data["status"].(string)
+		active := status != "completed" && status != "error" && status != "dead_letter" && status != "cleared"
+		key := strings.ToLower(hash)
+		current, exists := owners[key]
+		if !exists || active && !current.active || active == current.active &&
+			strings.EqualFold(client, "qBittorrent") && !strings.EqualFold(current.client, "qBittorrent") {
+			owners[key] = owner{client: client, active: active}
+		}
+	}
+	preferred := make(map[string]string, len(owners))
+	for hash, owner := range owners {
+		preferred[hash] = owner.client
+	}
+	return preferred
 }
 
 func buildMergedJobEntry(s *Server, matchedJob struct {
@@ -835,10 +890,7 @@ func mergedJobProgress(s *Server, matchedJob struct {
 	if status == "completed" || status == "completed_unorganized" {
 		return 100
 	}
-	if !s.cfg.HasQBittorrent() {
-		return 0
-	}
-	if f, ok := download.TorrentFileForTitle(s.mgr.QB().GetTorrentFiles(tor.Hash), title); ok {
+	if f, ok := download.TorrentFileForTitle(s.mgr.TorrentFiles(tor), title); ok {
 		return float64(int(f.Progress*1000)) / 10.0
 	}
 	return 0
@@ -859,10 +911,7 @@ func buildArchiveEntry(s *Server, tor qbit.Torrent, hashJobs []struct {
 	Data map[string]interface{}
 }, statusMap map[string]string, progress float64, speed string) models.DownloadEntry {
 	infoHash, _ := hashJobs[0].Data["info_hash"].(string)
-	var filesList []qbit.TorrentFile
-	if s.cfg.HasQBittorrent() {
-		filesList = s.mgr.QB().GetTorrentFiles(tor.Hash)
-	}
+	filesList := s.mgr.TorrentFiles(tor)
 	files := make([]models.DownloadFile, 0, len(hashJobs))
 	var wantedBytes int64
 	for _, j := range hashJobs {
@@ -1080,12 +1129,13 @@ func jTitle(data map[string]interface{}) string {
 }
 
 func (s *Server) handleDeleteTorrent(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.HasQBittorrent() {
-		writeError(w, 400, "qBittorrent is not configured")
+	if !s.cfg.HasQBittorrent() && !s.cfg.HasTransmission() {
+		writeError(w, 400, "no torrent download client is configured")
 		return
 	}
 	hash := chi.URLParam(r, "hash")
-	ok := s.mgr.QB().DeleteTorrent(hash, true)
+	preferredClient := preferredTorrentOwners(s.mgr.Jobs().Items())[strings.ToLower(hash)]
+	ok := s.mgr.DeleteTorrentByHash(hash, preferredClient, true)
 	writeJSON(w, 200, map[string]interface{}{"success": ok})
 }
 
