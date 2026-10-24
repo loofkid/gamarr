@@ -223,7 +223,7 @@ func (s *Server) handleSearchRequest(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		results := search.SearchProwlarr(s.cfg, query, platformFilter)
@@ -248,6 +248,13 @@ func (s *Server) handleSearchRequest(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		results := search.SearchMinerva(s.cfg.Sources, query, platformFilter)
+		mu.Lock()
+		allResults = append(allResults, results...)
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		results := search.SearchNoPayStation(query, platformFilter)
 		mu.Lock()
 		allResults = append(allResults, results...)
 		mu.Unlock()
@@ -300,6 +307,10 @@ func (s *Server) handleDownloadForRequest(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if !validNoPayStationDownload(body.Indexer, body.DownloadURL) {
+		writeError(w, http.StatusBadRequest, "NoPayStation package URL is not on an approved Sony download host")
+		return
+	}
 
 	// Use the request's platform info if not specified in the download body.
 	if body.Platform == "" {
@@ -324,8 +335,8 @@ func (s *Server) handleDownloadForRequest(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusBadRequest, "No download URL")
 			return
 		}
-		jobID = s.mgr.DownloadDDL(body.DownloadURL, body.VimmID, body.Title,
-			body.Platform, body.PlatformSlug, body.IsPC)
+		jobID = s.mgr.DownloadDDLWithChecksum(body.DownloadURL, body.VimmID, body.Title,
+			body.Platform, body.PlatformSlug, body.IsPC, body.SHA256)
 	} else if body.DownloadProtocol == "nzb" {
 		if body.DownloadURL == "" {
 			writeError(w, http.StatusBadRequest, "No NZB URL")

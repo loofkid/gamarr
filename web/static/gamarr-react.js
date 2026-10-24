@@ -9641,7 +9641,7 @@ function C({ item: e, busy: t, onDownload: n }) {
 						children: e.platform
 					}), /* @__PURE__ */ (0, m.jsx)("span", {
 						className: "block px-2 py-0.5 rounded bg-slate-800 text-slate-300",
-						children: i ? "DDL" : e.download_protocol === "nzb" ? "NZB" : "Torrent"
+						children: i ? e.indexer === "NoPayStation" ? "PKG" : "DDL" : e.download_protocol === "nzb" ? "NZB" : "Torrent"
 					})]
 				}),
 				/* @__PURE__ */ (0, m.jsxs)("div", {
@@ -10214,6 +10214,7 @@ function ue({ call: e, toast: t }) {
 						children: [
 							"prowlarr",
 							"qbittorrent",
+							"transmission",
 							"sabnzbd",
 							"nzbget",
 							"flaresolverr"
@@ -10222,7 +10223,7 @@ function ue({ call: e, toast: t }) {
 							className: "secondary text-left",
 							children: [
 								"Test ",
-								e,
+								e === "transmission" ? "Transmission" : e,
 								/* @__PURE__ */ (0, m.jsx)("span", {
 									id: `test-${e}-status`,
 									className: "block text-xs mt-1",

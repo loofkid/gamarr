@@ -23,7 +23,7 @@ func (s *Server) searchForTorznab(ctx context.Context, query, platformSlug strin
 		slug = ""
 	}
 
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		results := search.SearchProwlarr(s.cfg, query, slug)
@@ -48,6 +48,13 @@ func (s *Server) searchForTorznab(ctx context.Context, query, platformSlug strin
 	go func() {
 		defer wg.Done()
 		results := search.SearchMinerva(s.cfg.Sources, query, slug)
+		mu.Lock()
+		allResults = append(allResults, results...)
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		results := search.SearchNoPayStation(query, slug)
 		mu.Lock()
 		allResults = append(allResults, results...)
 		mu.Unlock()

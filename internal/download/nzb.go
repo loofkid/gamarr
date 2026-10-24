@@ -456,6 +456,9 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 	if vimmID := strVal(job, "vimm_id"); vimmID != "" {
 		return m.retryVimmJob(jobID, job, vimmID)
 	}
+	if strVal(job, "source_name") == "nopaystation" {
+		return m.retryNoPayStationJob(jobID, job)
+	}
 	hash := strVal(job, "info_hash")
 	if hash == "" {
 		return false, "This job has no torrent recorded, so there is nothing to import again"
@@ -510,6 +513,32 @@ func (m *Manager) retryVimmJob(jobID string, job map[string]interface{}, vimmID 
 	go func() {
 		defer m.activeDDL.Delete(jobID)
 		m.runDDLDownloadWorker(jobID, "", vimmID, strVal(job, "title"), strVal(job, "platform"), strVal(job, "platform_slug"), isPC)
+	}()
+	return true, fmt.Sprintf("Retrying (#%d)", retryCount+1)
+}
+
+func (m *Manager) retryNoPayStationJob(jobID string, job map[string]interface{}) (bool, string) {
+	dlURL := strVal(job, "download_url")
+	if dlURL == "" {
+		return false, "This NoPayStation job has no download URL to retry"
+	}
+	if _, busy := m.activeDDL.LoadOrStore(jobID, struct{}{}); busy {
+		return false, "A direct-download retry is already running for this job"
+	}
+
+	retryCount := jobRetryCount(job)
+	isPC, _ := job["is_pc"].(bool)
+	m.jobs.UpdateMulti(jobID, map[string]interface{}{
+		"status":      "downloading",
+		"error":       nil,
+		"detail":      fmt.Sprintf("Retry #%d", retryCount+1),
+		"retry_count": retryCount + 1,
+	})
+	m.jobs.LogActivity("download_retried", strVal(job, "title"), fmt.Sprintf("Retry #%d", retryCount+1), jobID, nil)
+
+	go func() {
+		defer m.activeDDL.Delete(jobID)
+		m.runDDLDownloadWorkerWithChecksum(jobID, dlURL, "", strVal(job, "title"), strVal(job, "platform"), strVal(job, "platform_slug"), isPC, strVal(job, "sha256"))
 	}()
 	return true, fmt.Sprintf("Retrying (#%d)", retryCount+1)
 }

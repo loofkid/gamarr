@@ -130,6 +130,7 @@ Open `http://localhost:5001` in your browser.
 
 - **Pluggable indexer registry** -- driver kinds (Torznab proxy, DDL archive listing, web-scrape, Minerva browse listing) loaded at runtime from an embedded JSON registry; optionally overrideable via `GAMARR_SOURCES_URL` / `GAMARR_SOURCES_PATH`
 - **Minerva Archive** -- loads the per-system browse page (every title on that console), caches it for an hour, and matches locally. Hits use the shared console archive magnet; Gamarr selects the matching ROM via qBittorrent priorities or Transmission's per-file wanted state. Ranked above Prowlarr.
+- **NoPayStation** -- searches the official PS3, PSP, PS Vita, and PS1 TSV catalogs and downloads the direct Sony `.pkg` package through Gamarr's DDL pipeline, verifying the catalog SHA-256 when available.
 - **52 gaming platforms** -- PC, Switch, PS1-PS4, PSP, PS Vita, Xbox, Xbox 360, Wii, Wii U, GameCube, N64, (S)NES, the Game Boy family, DS, 3DS, Sega 8-bit to Dreamcast, PC Engine, Neo Geo, Atari, and more, filed into RomM-compatible folders (see [Supported Platforms](#supported-platforms))
 - **Search scoring** -- composite 0-100 score based on title match, platform relevance, seeder count, file size, and safety analysis
 - **Safety scoring** -- analyzes file names, sizes, and scene group trust to detect malware, crack-only uploads, and suspicious downloads
@@ -256,6 +257,8 @@ Every platform lives in one table, `internal/platform/registry.go`. Category map
 | DOS | `dos` | -- | -- | -- | -- |
 
 Arcade is deliberately not a platform: MAME sets are tied to an emulator version and cannot be filed reliably. Current-generation consoles are out of scope.
+
+NoPayStation's game catalogs are searched for PS1, PS3, PSP, and PS Vita titles.
 
 **How a download finds its platform**
 

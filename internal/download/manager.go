@@ -4,7 +4,9 @@ package download
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -582,6 +584,12 @@ func (m *Manager) resolveAddedHash(knownBefore map[string]bool, title string) (s
 
 // DownloadDDL starts a direct download.
 func (m *Manager) DownloadDDL(url, vimmID, title, platf, platSlug string, isPC bool) string {
+	return m.DownloadDDLWithChecksum(url, vimmID, title, platf, platSlug, isPC, "")
+}
+
+// DownloadDDLWithChecksum starts a direct download and verifies an optional
+// expected SHA-256 before allowing the file into the scan/import pipeline.
+func (m *Manager) DownloadDDLWithChecksum(url, vimmID, title, platf, platSlug string, isPC bool, expectedSHA256 string) string {
 	jobID := newJobID()
 	job := map[string]interface{}{
 		"status":        "downloading",
@@ -599,8 +607,16 @@ func (m *Manager) DownloadDDL(url, vimmID, title, platf, platSlug string, isPC b
 	if vimmID != "" {
 		job["vimm_id"] = vimmID
 	}
+	source := m.ddlSourceName(url, vimmID)
+	if source == "nopaystation" {
+		job["source_name"] = source
+		job["download_url"] = url
+		if expectedSHA256 != "" {
+			job["sha256"] = strings.ToLower(strings.TrimSpace(expectedSHA256))
+		}
+	}
 	m.jobs.Set(jobID, job)
-	go m.ddlDownloadWorker(jobID, url, vimmID, title, platf, platSlug, isPC)
+	go m.ddlDownloadWorkerWithChecksum(jobID, url, vimmID, title, platf, platSlug, isPC, expectedSHA256)
 	return jobID
 }
 
@@ -1732,18 +1748,26 @@ func (m *Manager) organizeWithScan(jobID string, torrent *qbit.Torrent, platf, p
 }
 
 func (m *Manager) ddlDownloadWorker(jobID, dlURL, vimmID, title, platf, platSlug string, isPC bool) {
+	m.ddlDownloadWorkerWithChecksum(jobID, dlURL, vimmID, title, platf, platSlug, isPC, "")
+}
+
+func (m *Manager) ddlDownloadWorkerWithChecksum(jobID, dlURL, vimmID, title, platf, platSlug string, isPC bool, expectedSHA256 string) {
 	if _, busy := m.activeDDL.LoadOrStore(jobID, struct{}{}); busy {
 		slog.Warn("a direct-download worker is already running", "job_id", jobID)
 		return
 	}
 	defer m.activeDDL.Delete(jobID)
-	m.runDDLDownloadWorker(jobID, dlURL, vimmID, title, platf, platSlug, isPC)
+	m.runDDLDownloadWorkerWithChecksum(jobID, dlURL, vimmID, title, platf, platSlug, isPC, expectedSHA256)
 }
 
 // runDDLDownloadWorker performs a direct download after its caller has claimed
 // the job in activeDDL. RetryJob claims before changing the persisted status so
 // two simultaneous retry requests cannot both report success.
 func (m *Manager) runDDLDownloadWorker(jobID, dlURL, vimmID, title, platf, platSlug string, isPC bool) {
+	m.runDDLDownloadWorkerWithChecksum(jobID, dlURL, vimmID, title, platf, platSlug, isPC, "")
+}
+
+func (m *Manager) runDDLDownloadWorkerWithChecksum(jobID, dlURL, vimmID, title, platf, platSlug string, isPC bool, expectedSHA256 string) {
 	staging := m.cfg.QBSavePath
 	if err := os.MkdirAll(staging, 0755); err != nil {
 		slog.Error("cannot create staging dir", "path", staging, "error", err)
@@ -1760,7 +1784,7 @@ func (m *Manager) runDDLDownloadWorker(jobID, dlURL, vimmID, title, platf, platS
 	if vimmID != "" {
 		filepath_ = m.downloadVimmGame(vimmID, staging, jobID)
 	} else if dlURL != "" {
-		filepath_, dlErr = m.downloadDDL(dlURL, staging, jobID)
+		filepath_, dlErr = m.downloadDDLWithChecksum(dlURL, staging, jobID, expectedSHA256)
 	}
 
 	source := m.ddlSourceName(dlURL, vimmID)
@@ -1842,6 +1866,10 @@ func (m *Manager) ddlSourceName(dlURL, vimmID string) string {
 		}
 	}
 	if u, err := url.Parse(dlURL); err == nil {
+		host := strings.ToLower(u.Hostname())
+		if host == "dl.playstation.net" || strings.HasSuffix(host, ".dl.playstation.net") {
+			return "nopaystation"
+		}
 		if strings.Contains(u.Host, "minerva-archive") {
 			return "minerva"
 		}
@@ -1853,7 +1881,44 @@ func (m *Manager) ddlSourceName(dlURL, vimmID string) string {
 }
 
 func (m *Manager) downloadDDL(dlURL, destPath, jobID string) (string, error) {
-	client := &http.Client{Timeout: 5 * time.Minute}
+	return m.downloadDDLWithChecksum(dlURL, destPath, jobID, "")
+}
+
+func (m *Manager) downloadDDLWithChecksum(dlURL, destPath, jobID, expectedSHA256 string) (string, error) {
+	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
+	var digest io.Writer
+	var hasher interface {
+		Write([]byte) (int, error)
+		Sum([]byte) []byte
+	}
+	if expectedSHA256 != "" {
+		if len(expectedSHA256) != sha256.Size*2 {
+			return "", fmt.Errorf("invalid expected SHA-256 checksum")
+		}
+		if _, err := hex.DecodeString(expectedSHA256); err != nil {
+			return "", fmt.Errorf("invalid expected SHA-256 checksum")
+		}
+		hasher = sha256.New()
+		digest = hasher
+	}
+	timeout := 5 * time.Minute
+	if search.NoPayStationDownloadURLAllowed(dlURL) {
+		// Console packages can be multi-gigabyte; allow a longer total transfer
+		// window than the shorter archive-listing downloads.
+		timeout = 6 * time.Hour
+	}
+	client := &http.Client{Timeout: timeout}
+	if search.NoPayStationDownloadURLAllowed(dlURL) {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			if !search.NoPayStationDownloadURLAllowed(req.URL.String()) {
+				return fmt.Errorf("blocked NoPayStation redirect to an unapproved host")
+			}
+			return nil
+		}
+	}
 	req, _ := http.NewRequest("GET", dlURL, nil)
 	req.Header.Set("User-Agent", "Gamarr/1.0")
 
@@ -1905,6 +1970,11 @@ func (m *Manager) downloadDDL(dlURL, destPath, jobID string) (string, error) {
 			if _, writeErr = f.Write(buf[:n]); writeErr != nil {
 				break
 			}
+			if digest != nil {
+				if _, writeErr = digest.Write(buf[:n]); writeErr != nil {
+					break
+				}
+			}
 			downloaded += int64(n)
 			if time.Since(lastUpdate) > 2*time.Second && total > 0 {
 				pct := float64(downloaded) / float64(total) * 100
@@ -1930,6 +2000,10 @@ func (m *Manager) downloadDDL(dlURL, destPath, jobID string) (string, error) {
 	if total > 0 && downloaded != total {
 		os.Remove(fp)
 		return "", fmt.Errorf("incomplete download: got %s of %s", search.HumanSize(downloaded), search.HumanSize(total))
+	}
+	if hasher != nil && hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 {
+		os.Remove(fp)
+		return "", fmt.Errorf("SHA-256 checksum mismatch; downloaded file removed")
 	}
 	m.jobs.Update(jobID, "detail", fmt.Sprintf("Downloaded %s", search.HumanSize(downloaded)))
 	return fp, nil

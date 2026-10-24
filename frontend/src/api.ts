@@ -28,6 +28,7 @@ export interface SearchResult {
   seeders?: number;
   leechers?: number;
   size_human?: string;
+  sha256?: string;
   safety_score?: number;
   safety_warnings?: string[];
   [key: string]: unknown;

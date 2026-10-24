@@ -407,7 +407,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 
 	// Search all sources concurrently
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		slug := platformFilter
@@ -448,6 +448,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			slug = ""
 		}
 		results := search.SearchMinerva(s.cfg.Sources, query, slug)
+		mu.Lock()
+		allResults = append(allResults, results...)
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		slug := platformFilter
+		if slug == "all" {
+			slug = ""
+		}
+		results := search.SearchNoPayStation(query, slug)
 		mu.Lock()
 		allResults = append(allResults, results...)
 		mu.Unlock()
@@ -533,6 +544,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		{"name": "prowlarr", "label": "Prowlarr", "color": "#f97316", "source_type": "torrent", "enabled": s.cfg.HasProwlarr(), "indexers": prowlarrIndexers},
 		{"name": "myrient", "label": "Myrient", "color": "#10b981", "source_type": "ddl", "enabled": true},
 		{"name": "vimm", "label": "Vimm's Lair", "color": "#6366f1", "source_type": "ddl", "enabled": true},
+		{"name": "nopaystation", "label": "NoPayStation", "color": "#8b5cf6", "source_type": "ddl", "enabled": true},
 		{"name": "minerva", "label": "Minerva", "color": "#14b8a6", "source_type": "torrent", "enabled": true},
 	}
 
@@ -561,6 +573,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		{"name": "prowlarr", "label": "Prowlarr", "color": "#f97316", "source_type": "torrent", "enabled": s.cfg.HasProwlarr()},
 		{"name": "myrient", "label": "Myrient", "color": "#10b981", "source_type": "ddl", "enabled": true},
 		{"name": "vimm", "label": "Vimm's Lair", "color": "#6366f1", "source_type": "ddl", "enabled": true},
+		{"name": "nopaystation", "label": "NoPayStation", "color": "#8b5cf6", "source_type": "ddl", "enabled": true},
 		{"name": "minerva", "label": "Minerva", "color": "#14b8a6", "source_type": "torrent", "enabled": true},
 	}
 	// Attach health data to each source
@@ -579,6 +592,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Invalid request body")
 		return
 	}
+	if !validNoPayStationDownload(req.Indexer, req.DownloadURL) {
+		writeError(w, http.StatusBadRequest, "NoPayStation package URL is not on an approved Sony download host")
+		return
+	}
 
 	// Check for duplicate in library (warn but don't block)
 	var duplicateWarning string
@@ -591,7 +608,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "No download URL")
 			return
 		}
-		jobID := s.mgr.DownloadDDL(req.DownloadURL, req.VimmID, req.Title, req.Platform, req.PlatformSlug, req.IsPC)
+		jobID := s.mgr.DownloadDDLWithChecksum(req.DownloadURL, req.VimmID, req.Title, req.Platform, req.PlatformSlug, req.IsPC, req.SHA256)
 		resp := map[string]interface{}{"success": true, "job_id": jobID}
 		if duplicateWarning != "" {
 			resp["warning"] = duplicateWarning
@@ -654,7 +671,7 @@ func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
 		"pausedUP": "completed", "queuedUP": "completed",
 		"checkingDL": "checking", "checkingUP": "checking",
 		"stoppedDL": "paused",
-		"error": "error", "missingFiles": "error",
+		"error":     "error", "missingFiles": "error",
 		"queuedVerify": "checking", "checking": "checking",
 		"seeding": "completed", "stopped": "paused",
 	}
@@ -1120,7 +1137,13 @@ func archiveStatus(files []models.DownloadFile, torState string, statusMap map[s
 func jobCanRetry(data map[string]interface{}) bool {
 	infoHash, _ := data["info_hash"].(string)
 	vimmID, _ := data["vimm_id"].(string)
-	return infoHash != "" || vimmID != ""
+	sourceName, _ := data["source_name"].(string)
+	downloadURL, _ := data["download_url"].(string)
+	return infoHash != "" || vimmID != "" || (sourceName == "nopaystation" && downloadURL != "")
+}
+
+func validNoPayStationDownload(indexer, downloadURL string) bool {
+	return indexer != "NoPayStation" || search.NoPayStationDownloadURLAllowed(downloadURL)
 }
 
 func jTitle(data map[string]interface{}) string {
@@ -1186,6 +1209,8 @@ func (s *Server) handleDDLSources(w http.ResponseWriter, r *http.Request) {
 			"platforms": search.MyrientPlatformSlugs(s.cfg.Sources)},
 		{"name": "Vimm's Lair", "url": s.cfg.Sources.Vimm.BaseURL, "type": "vimm", "builtin": true,
 			"platforms": search.VimmPlatformSlugs(s.cfg.Sources)},
+		{"name": "NoPayStation", "url": "https://nopaystation.com/tsv/", "type": "nopaystation", "builtin": true,
+			"platforms": []string{"ps3", "psp", "psvita", "psx"}},
 	}
 	custom := s.mgr.LoadDDLSources()
 	all := append(builtIn, custom...)

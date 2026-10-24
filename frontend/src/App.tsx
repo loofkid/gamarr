@@ -764,7 +764,9 @@ function SearchCard({
           </span>
           <span className="block px-2 py-0.5 rounded bg-slate-800 text-slate-300">
             {direct
-              ? "DDL"
+              ? item.indexer === "NoPayStation"
+                ? "PKG"
+                : "DDL"
               : item.download_protocol === "nzb"
                 ? "NZB"
                 : "Torrent"}
@@ -1418,13 +1420,13 @@ function SettingsTab({
       <div className="grid gap-5 lg:grid-cols-2">
         <Panel title="Connections">
           <div className="grid grid-cols-2 gap-3">
-            {["prowlarr", "qbittorrent", "sabnzbd", "nzbget", "flaresolverr"].map((service) => (
+            {["prowlarr", "qbittorrent", "transmission", "sabnzbd", "nzbget", "flaresolverr"].map((service) => (
               <button
                 key={service}
                 onClick={() => void test(service)}
                 className="secondary text-left"
               >
-                Test {service}
+                Test {service === "transmission" ? "Transmission" : service}
                 <span id={`test-${service}-status`} className="block text-xs mt-1">{connectionStatus[service]}</span>
               </button>
             ))}

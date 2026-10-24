@@ -23,6 +23,7 @@ type SearchResult struct {
 	SafetyScore      int      `json:"safety_score"`
 	SafetyWarnings   []string `json:"safety_warnings"`
 	VimmID           string   `json:"vimm_id,omitempty"`
+	SHA256           string   `json:"sha256,omitempty"`
 
 	// Library duplicate detection
 	InLibrary bool `json:"in_library"`
@@ -106,6 +107,7 @@ type DownloadRequest struct {
 	SourceType       string `json:"source_type"`
 	Indexer          string `json:"indexer"`
 	VimmID           string `json:"vimm_id"`
+	SHA256           string `json:"sha256"`
 	DownloadProtocol string `json:"download_protocol"` // "torrent" or "nzb"
 }
 
