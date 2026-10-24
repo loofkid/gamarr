@@ -1348,7 +1348,7 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 		return false // Don't delete torrent
 	}
 
-	if m.shouldFinishTorrent(torrentClientForTorrent(torrent), torrentHash, torrentName) {
+	if m.shouldFinishTorrent(torrentClientForTorrent(*torrent), torrentHash, torrentName) {
 		m.finishTorrent(torrent.Client, torrentHash, torrentName, importMode)
 	}
 	return false
